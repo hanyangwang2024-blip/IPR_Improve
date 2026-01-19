@@ -54,12 +54,22 @@ class VLLMWorker(BaseModelWorker):
         logger.info(
             f"Loading the model {self.model_names} on worker {worker_id}, worker type: vLLM worker..."
         )
-        self.tokenizer = llm_engine.engine.tokenizer
-        # This is to support vllm >= 0.2.7 where TokenizerGroup was introduced
-        # and llm_engine.engine.tokenizer was no longer a raw tokenizer
-        if hasattr(self.tokenizer, "tokenizer"):
-            self.tokenizer = llm_engine.engine.tokenizer.tokenizer
-        self.context_len = get_context_length(llm_engine.engine.model_config.hf_config)
+        # vLLM >= 0.13.0 (v1 engine): AsyncLLM has direct tokenizer and model_config attributes
+        # vLLM < 0.13.0: AsyncLLMEngine has engine.tokenizer and engine.model_config
+        if hasattr(llm_engine, 'engine'):
+            # Old API (vLLM < 0.13.0)
+            self.tokenizer = llm_engine.engine.tokenizer
+            # This is to support vllm >= 0.2.7 where TokenizerGroup was introduced
+            # and llm_engine.engine.tokenizer was no longer a raw tokenizer
+            if hasattr(self.tokenizer, "tokenizer"):
+                self.tokenizer = llm_engine.engine.tokenizer.tokenizer
+            self.context_len = get_context_length(llm_engine.engine.model_config.hf_config)
+        else:
+            # New API (vLLM >= 0.13.0, v1 engine)
+            self.tokenizer = llm_engine.tokenizer
+            if hasattr(self.tokenizer, "tokenizer"):
+                self.tokenizer = self.tokenizer.tokenizer
+            self.context_len = get_context_length(llm_engine.model_config.hf_config)
 
         if not no_register:
             self.init_heart_beat()
@@ -103,14 +113,13 @@ class VLLMWorker(BaseModelWorker):
             n=1,
             temperature=temperature,
             top_p=top_p,
-            use_beam_search=use_beam_search,
             stop=list(stop),
             stop_token_ids=stop_token_ids,
             max_tokens=max_new_tokens,
-            top_k=top_k,
+            top_k=int(top_k) if top_k is not None else -1,
             presence_penalty=presence_penalty,
             frequency_penalty=frequency_penalty,
-            best_of=best_of,
+            # use_beam_search 和 best_of 在新版 vLLM 中已移除
         )
         results_generator = engine.generate(context, sampling_params, request_id)
 
@@ -254,7 +263,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--gpu_memory_utilization",
         type=float,
-        default=0.9,
+        default=0.8,
         help="The ratio (between 0 and 1) of GPU memory to"
         "reserve for the model weights, activations, and KV cache. Higher"
         "values will increase the KV cache size and thus improve the model's"
@@ -262,7 +271,24 @@ if __name__ == "__main__":
         "memory (OOM) errors.",
     )
 
-    parser = AsyncEngineArgs.add_cli_args(parser)
+    # vLLM 0.13.0+ uses 'deprecated' kwarg in add_argument which requires Python 3.13+
+    # Workaround: monkey-patch argparse BEFORE calling add_cli_args
+    import argparse as _argparse
+    _original_add_argument = _argparse.ArgumentParser.add_argument
+    _original_group_add_argument = _argparse._ArgumentGroup.add_argument
+    def _patched_add_argument(self, *args, **kwargs):
+        kwargs.pop('deprecated', None)
+        return _original_add_argument(self, *args, **kwargs)
+    def _patched_group_add_argument(self, *args, **kwargs):
+        kwargs.pop('deprecated', None)
+        return _original_group_add_argument(self, *args, **kwargs)
+    _argparse.ArgumentParser.add_argument = _patched_add_argument
+    _argparse._ArgumentGroup.add_argument = _patched_group_add_argument
+    try:
+        parser = AsyncEngineArgs.add_cli_args(parser)
+    finally:
+        _argparse.ArgumentParser.add_argument = _original_add_argument
+        _argparse._ArgumentGroup.add_argument = _original_group_add_argument
     args = parser.parse_args()
     if args.model_path:
         args.model = args.model_path

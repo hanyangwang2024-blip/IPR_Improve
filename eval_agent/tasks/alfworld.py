@@ -6,6 +6,7 @@ from typing import Iterable, Tuple
 
 import alfworld
 import alfworld.agents.environment as envs
+from alfworld.agents.environment.alfred_tw_env import AlfredTWEnv
 
 from eval_agent.tasks.base import Task
 
@@ -30,7 +31,7 @@ class AlfWorldTask(Task):
     def __init__(
         self,
         game_file: str,
-        env: envs.AlfredTWEnv,
+        env: AlfredTWEnv,
         obs: str,
         **kwargs,
     ):
@@ -58,10 +59,9 @@ class AlfWorldTask(Task):
             split = "eval_out_of_distribution"
             N_TASKS = 134
 
-        env = getattr(alfworld.agents.environment, config["env"]["type"])(
-            config, train_eval=split
-        )
-        assert isinstance(env, alfworld.agents.environment.AlfredTWEnv)
+        env_class = envs.get_environment(config["env"]["type"])
+        env = env_class(config, train_eval=split)
+        assert isinstance(env, AlfredTWEnv)
         env = env.init_env(batch_size=batch_size)
 
         if part_num > 1:

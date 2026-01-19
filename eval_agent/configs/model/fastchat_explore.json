@@ -1,7 +1,8 @@
 {
     "agent_class": "FastChatAgent",
     "config": {
-        "controller_address": "http://localhost:21001",
+        "controller_address": "http://localhost:31012",
+        "base_port": 31012,
         "model_name": "vicuna-7b-v1.5",
         "max_new_tokens": 512,
         "temperature": 1

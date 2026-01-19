@@ -1,3 +1,10 @@
+"""
+Monte Carlo Sampling with Graph Update for ALFWorld
+
+This is the Graph-IPR version of monte_carlo_sample_alfworld.py.
+It integrates state graph updates during sampling.
+"""
+
 import os
 
 os.environ["OPENAI_API_KEY"] = "sb-ed07016f987c6bb701b74fcf399c56d067b5a5c8bc3ad177"
@@ -6,22 +13,26 @@ import json
 import logging
 import pathlib
 import argparse
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from tqdm import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 from colorama import Fore
 from copy import deepcopy
-
-# from webshop.web_agent_site.envs import WebAgentTextEnv  # Commented out - only needed for webshop task
 from glob import glob
+import time
 
 import eval_agent.tasks as tasks
 import eval_agent.agents as agents
 import eval_agent.envs as envs
 from eval_agent.utils.datatypes import State
-import time
 
-prompt_for_environment ={
+# Graph-IPR imports
+from graph_ipr.state_graph import StateActionGraph
+from graph_ipr.value_propagation import ValuePropagator
+
+
+# Prompt templates
+prompt_for_environment = {
     "webshop": [{
             "from": "human",
             "value": "You are web shopping.\nI will give you instructions about what to do.\nYou have to follow the instructions.\nEvery round I will give you an observation and a list of available actions, you have to respond an action based on the state and instruction.\nYou can use search action if search is available.\nYou can click one of the buttons in clickables.\nAn action should be of the following structure:\nsearch[keywords]\nclick[value]\nIf the action is not valid, perform nothing.\nKeywords in search are up to you, but the value in click must be a value in the list of available actions.\nRemember that your keywords in search should be carefully designed.\nYour response should use the following format:\n\nThought: I think ...\nAction: click[something]"
@@ -110,60 +121,23 @@ prompt_for_environment ={
             "from": "gpt",
             "value": "Thought: I'm back at the toilet paper hanger with the roll in hand. It's time to put the toilet paper on the hanger.\nAction: put toiletpaper 1 in/on toiletpaperhanger 1"
         }
-    ],
-    "intercode_sql":[
-        {
-            "from": "human",
-            "value": "You are a helpful assistant assigned with the task of problem-solving. To achieve this, you will interact with a MySQL Database system using SQL queries to answer a question.\nAt each turn, you should first provide your step-by-step thinking for solving the task. Your thought process should start with \"Thought: \", for example: Thought: I should write a SQL query that gets the average GNP and total population from nations whose government is US territory.\nAfter that, you have two options:\n1) Interact with a mysql programming environment and receive the corresponding output. Your code should start with \"Action: \" and should be surrounded with ```sql ``` tag, for example: Action: \\n```sql\\nSELECT AVG(GNP), SUM(population) FROM nations WHERE government = 'US Territory'\\n```\n2) Directly submit the result, for example: Action: submit.\nYou should use this format: \"Thought: your thought\\nAction: \\n```sql\\n<the mysql command>\\n```\". You will receive the corresponding output for your sql command.\nYour output should contain only one \"Action\" part.\nThe \"Action\" part should be executed with a mysql interpreter or propose an answer. Any natural language in it should be commented out.\nThe SQL query and submit parts can not appear in your output simutaneously."
-        },
-        {
-            "from": "gpt",
-            "value": "OK"
-        },
-        {
-            "from": "human",
-            "value": "What is the average GNP and total population in all nations whose government is US territory?"
-        },
-        {
-            "from": "gpt",
-            "value": "Thought: I should write a SQL query that gets the average GNP and total population from nations whose government is US territory.\nAction: \n```sql\nSELECT AVG(GNP), SUM(population) FROM nations WHERE government = 'US Territory'\n```"
-        },
-        {
-            "from": "human",
-            "value": "Observation: Error executing query: Table 'world_1.nations' doesn't exist"
-        },
-        {
-            "from": "gpt",
-            "value": "Thought: The `nations` table I used in the SQL query does not exist. I should check what tables exist.\nAction: \n```sql\nSHOW TABLES\n```"
-        },
-        {
-            "from": "human",
-            "value": "Observation: [('city',), ('country',), ('countrylanguage',)]"
-        },
-        {
-            "from": "gpt",
-            "value": "Thought: There are three tables. I can try writing a query using the `country` table since the question is asking\nabout countries.\nAction: \n```sql\nSELECT AVG(GNP), SUM(population) FROM country WHERE governmentform = 'US Territory'\n```"
-        },
-        {
-            "from": "human",
-            "value": "Observation: [(510.333333, Decimal('329000'))]"
-        },
-        {
-            "from": "gpt",
-            "value": "Thought: The code executed successfully without any errors and produced the expected output. I can now submit the solution.\nAction: submit."
-        }
     ]}
 
 ignore_task_id = {
-    "webshop":[
-        114, 121, 151, 154, 167, 203, 365, 1320, 1506, 1563, 1577, 1599, 1663, 1695, 1739, 1838, 1884, 1931, 1967, 2066, 4051, 4247, 4560, 4638, 4942, 5926, 5932, 6292, 6700, 7241, 8617, 10612, 10816, 1165, 1858, 9049, 9061, 9067, 9070, 6066,
+    "webshop": [
+        114, 121, 151, 154, 167, 203, 365, 1320, 1506, 1563, 1577, 1599, 1663, 1695, 1739, 1838, 1884, 1931, 1967, 2066, 4051, 4247, 4560, 4638, 4942, 5926, 5932, 6292, 6700, 7241, 8617, 10612, 10816, 1165, 1858, 9049, 9061, 9067, 9070,
     ],
-    "alfworld":[],
-    "intercode_sql": []
+    "alfworld": []
 }
 
 
+# Global graph instance
+global_graph: Optional[StateActionGraph] = None
+value_propagator: Optional[ValuePropagator] = None
+
+
 def template_change(conversation):
+    """Convert from gpt/human format to role format"""
     messages = []
     for item in conversation:
         message = {}
@@ -177,129 +151,288 @@ def template_change(conversation):
     return messages
 
 
-# def generate_llm_response(args: argparse.Namespace):
-        
+def find_original_game_file(core_part, all_game_files):
+    for game_file in all_game_files:
+        if core_part in game_file:
+            return game_file
+    return None
 
-def construct_llm_data(args: argparse.Namespace):
+
+def construct_sample_data(args: argparse.Namespace):
+    """Construct data to be sampled from explored trajectories"""
+    to_be_sample_data = []
+    for file in glob(f"{args.data_path}/*.json"):
+        data = json.load(open(file))
+        for item in data:
+            agent_step_output = item['agent_step_output']
+            # ALFWorld doesn't have "Buy Now" action
+            new_item = {}
+            new_item['id'] = item['id']
+            new_item['iteration'] = item['iteration']
+            if 'game_file' in item:
+                new_item['game_file'] = item['game_file']
+            new_item['agent_step_output'] = agent_step_output
+            new_item['agent_step_reward'] = item['agent_step_reward']
+            new_item['agent_step_conversations'] = item['agent_step_conversations']
+            to_be_sample_data.append(new_item)
+    return to_be_sample_data
+
+
+def init_graph(args: argparse.Namespace):
+    """Initialize or load state graph"""
+    global global_graph, value_propagator
+
+    graph_path = os.path.join(args.save_path, "state_graph.pkl")
+
+    if os.path.exists(graph_path):
+        global_graph = StateActionGraph.load(graph_path)
+        print(f"Loaded existing graph with {len(global_graph.nodes)} nodes")
+    else:
+        global_graph = StateActionGraph(
+            task_name="alfworld",
+            max_nodes=args.max_graph_nodes,
+            gamma=args.gamma,
+            alpha=args.alpha,
+        )
+        print("Created new state graph")
+
+    value_propagator = ValuePropagator(
+        gamma=args.gamma,
+        alpha=args.alpha,
+        use_adaptive_alpha=True,
+    )
+
+
+def build_trajectory_from_state(state: State, task_id: int) -> List[Dict]:
+    """
+    Build trajectory data from State object.
+
+    Args:
+        state: The final state after trajectory execution
+        task_id: Task identifier
+
+    Returns:
+        List of {observation, action, reward} dicts
+    """
+    trajectory = []
+    history = state.history
+
+    # For ALFWorld, reward is binary (0 or 1)
+    # Distribute reward to final step only
+    num_steps = max(len(history) // 2, 1)
+
+    for i in range(0, len(history) - 1, 2):
+        user_msg = history[i]
+        assistant_msg = history[i + 1] if i + 1 < len(history) else None
+
+        if user_msg.get('role') != 'user':
+            continue
+
+        observation = user_msg.get('content', '')
+        action = assistant_msg.get('content', '') if assistant_msg else ""
+
+        # Only give reward to the last step
+        is_last = (i >= len(history) - 2)
+        step_reward = (1.0 if state.success else 0.0) if is_last else 0.0
+
+        trajectory.append({
+            'observation': observation,
+            'action': action,
+            'reward': step_reward,
+        })
+
+    return trajectory
+
+
+def sample_monte_carlo_response_with_graph(args: argparse.Namespace):
+    """
+    Monte Carlo sampling with graph update for ALFWorld.
+    """
+    global global_graph, value_propagator
+
+    # Load configs
     with open(os.path.join(args.exp_path, f"{args.exp_config}.json")) as f:
         exp_config: Dict[str, Any] = json.load(f)
     with open(os.path.join(args.agent_path, f"{args.agent_config}.json")) as f:
         agent_config: Dict[str, Any] = json.load(f)
-    
+
     if args.model_name is not None:
         agent_config['config']['model_name'] = args.model_name
 
     env_config = exp_config["env_config"]
     task_name = args.exp_config
-    
-    if 'env_class' in env_config and  env_config['env_class'] == 'WebShopEnv':
-        from webshop.web_agent_site.envs import WebAgentTextEnv
-        env_config['env'] = WebAgentTextEnv(observation_mode="text", human_goals=True)
 
-    # initialize the agent
+    # Initialize agent
     agent: agents.LMAgent = getattr(agents, agent_config["agent_class"])(
         agent_config["config"]
     )
 
-    # initialize all the tasks    
-    task_config: Dict[str, Any] = exp_config["task"]
-    
-    task_class: tasks.Task = getattr(tasks, task_config["task_class"])
-    
-    all_tasks, n_tasks = task_class.load_tasks("train", args.part_num, args.part_idx)
-    
-    sft_data = json.load(open(f"data/{task_name}_sft.json"))
-    temp = {}
-    for item in sft_data:
-        temp[item['id']] = item
-    sft_data = temp
-    
-    final_data = []
-    
-    print("Start generating pair_data")
+    ignore_task_ids = ignore_task_id[task_name]
 
-    tobe_ignore = ignore_task_id[task_name]
-    if task_name == "alfworld":
-        new_sft_data = {}
-        for value in sft_data.values():
-            new_sft_data[value['game_file']] = value
-    
+    # Initialize tasks
+    task_config: Dict[str, Any] = exp_config["task"]
+    task_class: tasks.Task = getattr(tasks, task_config["task_class"])
+    all_tasks, n_tasks = task_class.load_tasks("train", args.part_num, args.part_idx)
+
+    # Initialize graph
+    init_graph(args)
+
+    to_be_sample_data = construct_sample_data(args)
+
+    final_data = []
+    trajectories_added = 0
+
+    print("Start generating pair_data with graph update for ALFWorld")
+
+    all_game_files = json.load(open("alfworld_game_files.json"))
+
+    part_len = len(to_be_sample_data) // args.part_num + 1
+    to_be_sample_data = to_be_sample_data[args.part_idx * part_len: min((args.part_idx + 1) * part_len, len(to_be_sample_data))]
+    n_tasks = len(to_be_sample_data)
     pbar = tqdm(total=n_tasks)
-    for task in all_tasks:
-        if task.task_id in tobe_ignore:
+    default_task = all_tasks.__next__()
+
+    for i in range(n_tasks):
+        cur_sample_data = to_be_sample_data[i]
+        id = cur_sample_data['id']
+
+        if id in ignore_task_ids:
             pbar.update(1)
             continue
-        env: envs.BaseEnv = getattr(envs, env_config["env_class"])(task, **env_config)
-        
-        if task_name == "webshop" or task_name == "intercode_sql":
-            cur_sft_data = sft_data[task.task_id]
-        elif task_name == "alfworld":
-            game_file = "/".join(["data"] + task.game_file.split('/')[3: -1])
-            flag=True
-            if game_file in new_sft_data and flag:
-                cur_sft_data = new_sft_data[game_file]
-            else:
-                pbar.update(1)
-                continue
-        
-        conversations = cur_sft_data['conversations']
-        iteration_nums = len(conversations)//2-1
-        
-        for j in range(iteration_nums):
-            if args.global_only and j != 0:
-                continue
-            start_time = time.time()
-            
-            new_conversations = conversations[2 :2*j+3]
-            # if task_name == "webshop":
-            observation, state = env.reset()
-            env.state.history = template_change(prompt_for_environment[task_name] + [new_conversations[0]])
-            for i in range(1, len(new_conversations), 2):
-                observation, state = env.step(new_conversations[i]['value'])
-            
-            cur_step_llm_output: str = agent(env.state.history)
-            observation, state = env.step(cur_step_llm_output)
-            cur_step_llm_reward = state.reward
-            cur_step_conversation = deepcopy(state.history)
-            
-            while not state.finished:
-                try:
-                    llm_output: str = agent(state.history)
-                except Exception as e:
-                    state.success = False
-                    state.finished = True
-                    state.terminate_reason = "exceeding maximum input length"
-                    break
-                # environment step
-                observation, state = env.step(llm_output)
-                # color the state in blue
-                if state.finished:
-                    break
-            
-            end_time = time.time()
-            
-            new_item = {
-                "id": task.task_id,
-                "iteration": j,
-                'agent_step_output': cur_step_llm_output,
-                'agent_step_reward': cur_step_llm_reward,
-                "agent_step_conversations": cur_step_conversation,
-                "agent_conversations": state.history,
-                'agent_final_reward': state.reward if (task_name == "webshop" or task_name=="intercode_sql") else state.success,
-                'time': end_time - start_time,
-            }
-            
-            if task_name == "alfworld":
-                new_item['game_file'] = cur_sft_data['game_file']
-            
-            final_data.append(new_item)
+
+        default_task.task_id = id
+
+        env: envs.BaseEnv = getattr(envs, env_config["env_class"])(default_task, **env_config)
+
+        conversations = cur_sample_data['agent_step_conversations'][:2] + cur_sample_data['agent_step_conversations'][16:]
+        iteration = cur_sample_data['iteration']
+
+        start_time = time.time()
+
+        new_conversations = conversations[2:]
+
+        # ALFWorld specific: reset with game file
+        game_file = cur_sample_data['game_file']
+        core_part = "/".join(game_file.split("/")[3:])
+        original_game_file = find_original_game_file(core_part, all_game_files)
+        if original_game_file is None:
+            pbar.update(1)
+            continue
+
+        observation, state = env.reset([original_game_file])
+
+        env.state.history = template_change(prompt_for_environment[task_name]) + [new_conversations[0]]
+        for j in range(1, len(new_conversations), 2):
+            observation, state = env.step(new_conversations[j]['content'])
+
+        cur_step_llm_output: str = agent(env.state.history)
+        observation, state = env.step(cur_step_llm_output)
+        cur_step_llm_reward = state.reward
+        cur_step_conversation = deepcopy(state.history)
+
+        while not state.finished:
+            try:
+                llm_output: str = agent(state.history)
+            except Exception as e:
+                state.success = False
+                state.finished = True
+                state.terminate_reason = "exceeding maximum input length"
+                break
+            observation, state = env.step(llm_output)
+            if state.finished:
+                break
+
+        end_time = time.time()
+
+        # === Graph-IPR: Build trajectory and update graph ===
+        trajectory = build_trajectory_from_state(state, id)
+
+        if trajectory:
+            # Add trajectory to graph
+            state_edges = global_graph.add_trajectory(
+                task_id=id,
+                trajectory=trajectory,
+                final_reward=1.0 if state.success else 0.0,
+                is_successful=state.success,
+            )
+
+            # Incremental value updates
+            for state_node, edge in state_edges:
+                value_propagator.incremental_update(
+                    global_graph,
+                    edge.source_id,
+                    edge.action,
+                    edge.target_id,
+                    edge.immediate_reward,
+                )
+
+            # Backward propagation
+            state_sequence = [s.state_id for s, _ in state_edges]
+            if state_sequence:
+                if trajectory:
+                    final_obs = trajectory[-1]['observation']
+                    history_summary = global_graph._extract_history_summary(
+                        [{'role': 'user', 'content': t['observation']} for t in trajectory[:-1]] +
+                        [{'role': 'assistant', 'content': t['action']} for t in trajectory[:-1]]
+                    )
+                    final_state_id = global_graph._compute_state_id(id, final_obs, history_summary)
+                    state_sequence.append(final_state_id)
+
+                value_propagator.backward_propagation(
+                    global_graph,
+                    state_sequence,
+                    1.0 if state.success else 0.0,
+                )
+
+            trajectories_added += 1
+
+        # Save result
+        new_item = {
+            "id": id,
+            "iteration": iteration,
+            'agent_step_output': cur_sample_data['agent_step_output'],
+            'agent_step_reward': cur_sample_data['agent_step_reward'],
+            "agent_step_conversations": cur_sample_data['agent_step_conversations'],
+            "agent_conversations": state.history,
+            'agent_final_reward': state.success,
+            'time': end_time - start_time,
+            'game_file': cur_sample_data['game_file'],
+        }
+
+        final_data.append(new_item)
         pbar.update(1)
+
     pbar.close()
-            
+
+    # === Graph-IPR: Batch value iteration ===
+    print(f"\nRunning batch value iteration on graph with {len(global_graph.nodes)} nodes...")
+    v_values = value_propagator.batch_value_iteration(
+        global_graph,
+        num_iterations=args.vi_iterations,
+        convergence_threshold=1e-4,
+    )
+
+    # Save graph
+    graph_save_path = os.path.join(args.save_path, "state_graph.pkl")
+    global_graph.save(graph_save_path)
+    print(f"Saved state graph to {graph_save_path}")
+
+    # Save graph statistics
+    stats = global_graph.get_statistics()
+    stats['trajectories_added_this_run'] = trajectories_added
+    stats_path = os.path.join(args.save_path, "graph_stats.json")
+    json.dump(stats, open(stats_path, "w"), indent=2)
+    print(f"Graph statistics: {stats}")
+
+    # Save sampling results
+    os.makedirs(args.save_path, exist_ok=True)
     json.dump(final_data, open(f"{args.save_path}/{task_name}_traj_{args.part_idx}.json", "w"), indent=4)
 
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser("Run the interactive loop.")
+    parser = argparse.ArgumentParser("Monte Carlo Sampling with Graph Update for ALFWorld")
+
+    # Original arguments
     parser.add_argument(
         "--exp_path",
         type=str,
@@ -328,23 +461,20 @@ if __name__ == "__main__":
         "--model_name",
         type=str,
         required=False,
-        default="Llama-2-7b-hf-webshop-sft-explore-0",
-        help="Model name. It will override the 'model_name' in agent_config"
+        default="Llama-2-7b-hf-alfworld-sft-explore-0",
+        help="Model name."
     )
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="Whether to run in debug mode (10 ex per task).",
     )
     parser.add_argument(
         "--override",
         action="store_true",
-        help="Whether to ignore done tasks.",
     )
     parser.add_argument(
         "--interactive",
         action="store_false",
-        help="Whether to run in interactive mode for demo purpose.",
     )
     parser.add_argument(
         "--part_num",
@@ -354,16 +484,44 @@ if __name__ == "__main__":
     parser.add_argument(
         "--part_idx",
         type=int,
-        default=2,
+        default=0,
     )
     parser.add_argument(
         "--save_path",
         type=str,
+        default=""
     )
     parser.add_argument(
-        "--global_only",
-        action="store_true",
+        "--data_path",
+        type=str,
+        default=""
     )
-    
+
+    # Graph-IPR specific arguments
+    parser.add_argument(
+        "--gamma",
+        type=float,
+        default=0.99,  # Higher gamma for ALFWorld (longer trajectories)
+        help="Discount factor for value propagation"
+    )
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=0.1,
+        help="Learning rate for Q-value updates"
+    )
+    parser.add_argument(
+        "--max_graph_nodes",
+        type=int,
+        default=5000,  # Smaller for ALFWorld
+        help="Maximum number of nodes in the graph"
+    )
+    parser.add_argument(
+        "--vi_iterations",
+        type=int,
+        default=15,  # More iterations for ALFWorld
+        help="Number of value iteration rounds"
+    )
+
     args = parser.parse_args()
-    construct_llm_data(args)
+    sample_monte_carlo_response_with_graph(args)

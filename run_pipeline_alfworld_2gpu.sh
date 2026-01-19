@@ -1,26 +1,31 @@
-DEBUG_MODE="-m debugpy --listen 127.0.0.1:5679 --wait-for-client"
+#!/bin/bash
+
+# IPR Pipeline for ALFWorld with 2 GPUs (GPU 4, 5)
+# Usage: bash run_pipeline_alfworld_2gpu.sh <exp_name>
+
+export CUDA_VISIBLE_DEVICES=4,5
 
 model_name=Llama-2-7b-hf
-task=webshop
-worker_num=2
+task=alfworld
+worker_num=15  # reduced for 2 GPUs
 
 exp_name=$1
 
-node_num=4  # number of GPUs
-num_workers=4   # number of inference workers
-sample_node_num=8
-sample_num_workers=8
-
-model_path=/home/azureuser/weimin/models/ # path to the original LLM
-save_dir=/home/azureuser/weimin/agentpipeline/checkpoints_${task}/    # checkpoint save path
-save_path=/home/azureuser/weimin/agentpipeline/experiments/${model_name}-${task}-sft-step-entire-monte-carlo-beta-0.1-lr3e-6/  # output save path
-logs_path=${save_path}logs
-
-if [ "$task" == "intercode_sql" ]; then
-    docker stop docker-env-sql_ic_ctr
-    docker rm docker-env-sql_ic_ctr
-    bash setup_sql.sh
+if [ -z "$exp_name" ]; then
+    exp_name="exp"
+    echo "No experiment name provided, using default: ${exp_name}"
 fi
+
+node_num=2  # number of GPUs
+num_workers=2   # number of inference workers
+sample_node_num=2
+sample_num_workers=2
+
+# Using HuggingFace model directly
+model_path=meta-llama/  # HuggingFace model prefix
+save_dir=/home/jimchen/temp_hanyang/IPR/checkpoints_${task}/    # checkpoint save path
+save_path=/home/jimchen/temp_hanyang/IPR/experiments/${model_name}-${task}-sft-step-entire-monte-carlo-beta-0.1-lr3e-6/  # output save path
+logs_path=${save_path}logs
 
 if [ -d ${save_path} ]; then
     rm -r ${save_path}
@@ -30,11 +35,18 @@ mkdir -p ${logs_path}/
 
 # Part 1: SFT stage
 sft_data_path="data/${task}_sft.json"
-batch_size=48
-micro_batch_size=4
+batch_size=16  # reduced batch size for 2 GPUs
+micro_batch_size=2  # reduced for memory
 accumulation_step=$((${batch_size}/${node_num}/${micro_batch_size}))
 
 sft_model_name=${exp_name}${model_name}-${task}-sft-step-entire-monte-carlo-beta-0.1-lr3e-6
+
+echo "======================================"
+echo "Starting SFT Training"
+echo "Model: ${model_path}${model_name}"
+echo "Data: ${sft_data_path}"
+echo "Output: ${save_dir}${sft_model_name}"
+echo "======================================"
 
 python -m torch.distributed.run --nproc_per_node=${node_num} --master_port=20002 fastchat/train/train.py \
     --model_name_or_path ${model_path}${model_name} \
@@ -43,9 +55,9 @@ python -m torch.distributed.run --nproc_per_node=${node_num} --master_port=20002
     --output_dir ${save_dir}${sft_model_name} \
     --num_train_epochs 3 \
     --per_device_train_batch_size ${micro_batch_size} \
-    --per_device_eval_batch_size 4 \
+    --per_device_eval_batch_size 2 \
     --gradient_accumulation_steps ${accumulation_step} \
-    --evaluation_strategy "no" \
+    --eval_strategy "no" \
     --save_strategy "no" \
     --save_total_limit 5 \
     --learning_rate 2e-5 \
@@ -68,7 +80,7 @@ fi
 
 # Part 2: Evaluate SFT agent
 fs_worker_port=21012
-python -u -m fastchat.serve.vllm_worker --model-path ${save_dir}${sft_model_name} --port ${fs_worker_port} --worker-address http://localhost:${fs_worker_port} >> ${logs_path}/model_worker.log 2>&1 &
+CUDA_VISIBLE_DEVICES=4 python -u -m fastchat.serve.model_worker --model-path ${save_dir}${sft_model_name} --port ${fs_worker_port} --worker-address http://localhost:${fs_worker_port} >> ${logs_path}/model_worker.log 2>&1 &
 
 fs_worker_pid=$!
 sleep 60
@@ -89,16 +101,11 @@ kill -9 $fs_worker_pid
 cur_model_name=${sft_model_name}
 monte_carlo_explore_model_name=${cur_model_name}-monte-carlo-explore
 for i in {1..6}; do
+    echo "======================================"
+    echo "Starting IPR Iteration ${i}"
+    echo "======================================"
+
     # Part 3: Base agent explore stage
-    # launch the fastchat model worker
-
-    if [ "$task" == "intercode_sql" ]; then
-        docker stop docker-env-sql_ic_ctr
-        docker rm docker-env-sql_ic_ctr
-        bash setup_sql.sh
-        sleep 60
-    fi
-
     explore_model_name=${cur_model_name}-explore
 
     for ((j=0;j<${sample_num_workers};j=j+1)); do
@@ -114,9 +121,11 @@ for i in {1..6}; do
 
     fs_worker_port=21012
     worker_idx=0
+    gpu_list=(4 5)
     for ((j=0;j<${sample_num_workers};j=j+1)); do
-        echo "Launch the model worker on port ${fs_worker_port}"
-        CUDA_VISIBLE_DEVICES=$((${worker_idx} % ${sample_node_num})) python -u -m fastchat.serve.vllm_worker \
+        gpu_id=${gpu_list[$((j % 2))]}
+        echo "Launch the model worker on port ${fs_worker_port} with GPU ${gpu_id}"
+        CUDA_VISIBLE_DEVICES=${gpu_id} python -u -m fastchat.serve.model_worker \
             --model-path ${save_dir}${explore_model_name}-${j} \
             --port ${fs_worker_port} \
             --worker-address http://localhost:${fs_worker_port} >> ${logs_path}/model_worker-${j}.log 2>&1 &
@@ -125,7 +134,7 @@ for i in {1..6}; do
         worker_idx=$(($worker_idx+1))
         sleep 15
     done
-    
+
     sleep 60
 
     # start explore on the same sft data
@@ -141,7 +150,7 @@ for i in {1..6}; do
     mkdir -p ${step_traj_save_path}
 
     for (( j = 0; j <= $worker_num; j++ )); do
-        python3 generate_response.py --exp_config ${task} --model_name ${explore_model_name}-$((j%sample_node_num)) --part_num $((worker_num+1)) --part_idx ${j} --save_path ${step_traj_save_path}  >> ${logs_path}/gen_response_worker-${j}.log 2>&1 &
+        python3 generate_response.py --exp_config ${task} --model_name ${explore_model_name}-$((j%sample_num_workers)) --part_num $((worker_num+1)) --part_idx ${j} --save_path ${step_traj_save_path}  >> ${logs_path}/gen_response_worker-${j}.log 2>&1 &
         echo $! >> ${logs_path}/eval_pid.txt
     done
 
@@ -175,18 +184,12 @@ for i in {1..6}; do
         rm ${logs_path}/worker_pid.txt
     fi
 
-    if [ "$task" == "intercode_sql" ]; then
-        docker stop docker-env-sql_ic_ctr
-        docker rm docker-env-sql_ic_ctr
-        bash setup_sql.sh
-        sleep 60
-    fi
-
     fs_worker_port=21012
     worker_idx=0
     for ((j=0;j<${sample_num_workers};j=j+1)); do
-        echo "Launch the model worker on port ${fs_worker_port}"
-        CUDA_VISIBLE_DEVICES=$((${worker_idx} % ${sample_num_workers})) python -u -m fastchat.serve.vllm_worker \
+        gpu_id=${gpu_list[$((j % 2))]}
+        echo "Launch the model worker on port ${fs_worker_port} with GPU ${gpu_id}"
+        CUDA_VISIBLE_DEVICES=${gpu_id} python -u -m fastchat.serve.model_worker \
             --model-path ${save_dir}${monte_carlo_explore_model_name}-${j} \
             --port ${fs_worker_port} \
             --worker-address http://localhost:${fs_worker_port} >> ${logs_path}/model_worker-${j}.log 2>&1 &
@@ -204,7 +207,7 @@ for i in {1..6}; do
 
     sample_num=5
     per_iteration_num=5
-    sample_workers=16
+    sample_workers=8  # reduced for 2 GPUs
     sample_iterations=$((sample_num/per_iteration_num))
 
     for ((j=0;j<${sample_iterations};j=j+1));do
@@ -226,8 +229,6 @@ for i in {1..6}; do
         echo "Base agent has finished exploring ${j} iteration"
     done
 
-
-
     # kill the model worker
     echo "Kill the model workers"
     kill -9 $(cat ${logs_path}/worker_pid.txt)
@@ -237,7 +238,7 @@ for i in {1..6}; do
     # Part 5: Build contrastive action pairs
     echo "Build preference data"
     pm_data_path=${save_path}data_pm/${task}_${exp_name}_pm_${i}.json
-    
+
     if [ ! -d ${save_path}data_pm ]; then
         mkdir -p ${save_path}data_pm
     fi
@@ -245,24 +246,21 @@ for i in {1..6}; do
     python construct_preference_monte_carlo_${task}.py --task $task --output_path ${pm_data_path} --traj_path ${step_traj_save_path} --sample_path ${save_path}monte_carlo_sample_iteration_${i} --global_traj --local_traj --traj_threshold 0.01 --step_threshold 0.01
 
     # Part 6: Conduct mixture trajectory optimization to learn from incorrect actions
-    
-    batch_size=48
-    micro_batch_size=2
-    node_num=8
-    accumulation_step=$((${batch_size}/${node_num}/${micro_batch_size}))
+
+    batch_size=16  # reduced for 2 GPUs
+    micro_batch_size=1  # reduced for memory during DPO
+    dpo_node_num=2
+    accumulation_step=$((${batch_size}/${dpo_node_num}/${micro_batch_size}))
     beta=0.1
     lr=3e-6
 
-    if [ "$task" == "intercode_sql" ]; then
-        docker stop docker-env-sql_ic_ctr
-        docker rm docker-env-sql_ic_ctr
-        bash setup_sql.sh
-        sleep 60
-    fi
-    
     dpo_model_name=${sft_model_name}-dpo-iter-${i}
 
-    python -m torch.distributed.run --nproc_per_node=${node_num} --master_port=20002 fastchat/train/train_dpo.py \
+    echo "======================================"
+    echo "Starting DPO Training - Iteration ${i}"
+    echo "======================================"
+
+    python -m torch.distributed.run --nproc_per_node=${dpo_node_num} --master_port=20002 fastchat/train/train_dpo.py \
         --model_name_or_path ${save_dir}${cur_model_name} \
         --ref_model_name_or_path ${save_dir}${sft_model_name} \
         --data_path ${pm_data_path} \
@@ -270,9 +268,9 @@ for i in {1..6}; do
         --output_dir ${save_dir}${dpo_model_name} \
         --num_train_epochs 3 \
         --per_device_train_batch_size ${micro_batch_size} \
-        --per_device_eval_batch_size 4 \
+        --per_device_eval_batch_size 2 \
         --gradient_accumulation_steps ${accumulation_step} \
-        --evaluation_strategy "no" \
+        --eval_strategy "no" \
         --save_strategy "no" \
         --save_total_limit 5 \
         --beta ${beta} \
@@ -290,9 +288,9 @@ for i in {1..6}; do
         --gradient_checkpointing True \
         --lazy_preprocess False
 
-    # Part 6: Evaluate the agent
+    # Part 7: Evaluate the agent
     fs_worker_port=21012
-    python -u -m fastchat.serve.vllm_worker --model-path ${save_dir}${dpo_model_name} --port ${fs_worker_port} --worker-address http://localhost:${fs_worker_port} >> ${logs_path}/model_worker.log 2>&1 &
+    CUDA_VISIBLE_DEVICES=4 python -u -m fastchat.serve.model_worker --model-path ${save_dir}${dpo_model_name} --port ${fs_worker_port} --worker-address http://localhost:${fs_worker_port} >> ${logs_path}/model_worker.log 2>&1 &
 
     fs_worker_pid=$!
     sleep 60
@@ -312,3 +310,7 @@ for i in {1..6}; do
 
     cur_model_name=${dpo_model_name}
 done
+
+echo "======================================"
+echo "IPR Pipeline Completed!"
+echo "======================================"

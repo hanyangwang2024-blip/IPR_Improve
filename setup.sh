@@ -1,9 +1,9 @@
 # 1. Install Python dependencies
-conda create -n IPR python==3.9
-conda activate IPR
+#conda create -n IPR python==3.9
+conda activate iprvllm
 
-# pip install vllm==0.4.0.post1
-# pip install torch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu118
+pip install vllm==0.4.0.post1
+pip install torch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu118
 
 cd textworld
 pip install .

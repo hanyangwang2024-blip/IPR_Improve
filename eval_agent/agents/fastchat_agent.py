@@ -28,6 +28,7 @@ class FastChatAgent(LMAgent):
         config
     ) -> None:
         super().__init__(config)
+        self.config = config
         self.controller_address = config["controller_address"]
         self.model_name = config["model_name"]
         self.temperature = config.get("temperature", 0.8)
@@ -35,7 +36,17 @@ class FastChatAgent(LMAgent):
         self.top_p = config.get("top_p", 1)
 
     def __call__(self, messages: List[dict]) -> str:
+        # 支持 --no-register 模式：根据 model_name 后缀动态选择端口
+        # 例如 model-name-0 -> base_port, model-name-1 -> base_port+1, etc.
         controller_addr = self.controller_address
+        base_port = self.config.get("base_port", None)
+        if base_port is not None:
+            # 从 model_name 提取后缀数字
+            import re
+            match = re.search(r'-(\d+)$', self.model_name)
+            if match:
+                worker_idx = int(match.group(1))
+                controller_addr = f"http://localhost:{base_port + worker_idx}"
         worker_addr = controller_addr
         if worker_addr == "":
             raise ValueError
