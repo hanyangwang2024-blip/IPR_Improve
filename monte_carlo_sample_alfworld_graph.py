@@ -304,12 +304,17 @@ def sample_monte_carlo_response_with_graph(args: argparse.Namespace):
 
         env: envs.BaseEnv = getattr(envs, env_config["env_class"])(default_task, **env_config)
 
-        conversations = cur_sample_data['agent_step_conversations'][:2] + cur_sample_data['agent_step_conversations'][16:]
+        conversations = cur_sample_data['agent_step_conversations'][:2] + cur_sample_data['agent_step_conversations'][12:]
         iteration = cur_sample_data['iteration']
 
         start_time = time.time()
 
         new_conversations = conversations[2:]
+
+        # Skip if no conversations to process
+        if len(new_conversations) == 0:
+            pbar.update(1)
+            continue
 
         # ALFWorld specific: reset with game file
         game_file = cur_sample_data['game_file']
@@ -371,10 +376,12 @@ def sample_monte_carlo_response_with_graph(args: argparse.Namespace):
             if state_sequence:
                 if trajectory:
                     final_obs = trajectory[-1]['observation']
-                    history_summary = global_graph._extract_history_summary(
-                        [{'role': 'user', 'content': t['observation']} for t in trajectory[:-1]] +
-                        [{'role': 'assistant', 'content': t['action']} for t in trajectory[:-1]]
-                    )
+                    # 正确构建交替的 user/assistant 历史消息
+                    history_for_summary = []
+                    for t in trajectory[:-1]:
+                        history_for_summary.append({'role': 'user', 'content': t['observation']})
+                        history_for_summary.append({'role': 'assistant', 'content': t['action']})
+                    history_summary = global_graph._extract_history_summary(history_for_summary)
                     final_state_id = global_graph._compute_state_id(id, final_obs, history_summary)
                     state_sequence.append(final_state_id)
 
@@ -404,9 +411,10 @@ def sample_monte_carlo_response_with_graph(args: argparse.Namespace):
 
     pbar.close()
 
-    # === Graph-IPR: Batch value iteration ===
-    print(f"\nRunning batch value iteration on graph with {len(global_graph.nodes)} nodes...")
-    v_values = value_propagator.batch_value_iteration(
+    # === Graph-IPR: Prioritized Value Iteration ===
+    # 使用 TD-error 作为优先级，从终端状态向前传播，加速收敛
+    print(f"\nRunning prioritized value iteration on graph with {len(global_graph.nodes)} nodes...")
+    v_values = value_propagator.prioritized_value_iteration(
         global_graph,
         num_iterations=args.vi_iterations,
         convergence_threshold=1e-4,
@@ -522,6 +530,5 @@ if __name__ == "__main__":
         default=15,  # More iterations for ALFWorld
         help="Number of value iteration rounds"
     )
-
     args = parser.parse_args()
     sample_monte_carlo_response_with_graph(args)
