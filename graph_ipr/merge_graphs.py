@@ -81,8 +81,8 @@ def main():
     parser.add_argument(
         "--gamma",
         type=float,
-        default=0.95,
-        help="Discount factor"
+        default=0.99,
+        help="Discount factor (default 0.99 for ALFWorld)"
     )
     parser.add_argument(
         "--alpha",

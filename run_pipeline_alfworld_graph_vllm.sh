@@ -3,6 +3,41 @@
 # Graph-IPR Pipeline for ALFWorld - vLLM Version (Much Faster!)
 # Usage: bash run_pipeline_alfworld_graph_vllm.sh
 
+# Function to kill vLLM workers and free GPU memory
+kill_vllm_workers() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Killing vLLM workers..."
+
+    # Kill worker processes from pid files
+    if [ -f "${logs_path}/worker_pid.txt" ]; then
+        while read pid; do
+            if [ -n "$pid" ] && kill -0 $pid 2>/dev/null; then
+                kill -9 $pid 2>/dev/null
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')]   - Killed PID: $pid"
+            fi
+        done < ${logs_path}/worker_pid.txt
+        rm -f ${logs_path}/worker_pid.txt
+    fi
+
+    # Kill any processes on the vLLM worker ports
+    for port in 31012 31013 31014; do
+        pid=$(lsof -t -i :${port} 2>/dev/null)
+        if [ -n "$pid" ]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')]   - Killing process on port ${port} (PID: ${pid})"
+            kill -9 $pid 2>/dev/null
+        fi
+    done
+
+    # Kill any remaining vllm_worker processes
+    pkill -9 -f "vllm_worker" 2>/dev/null
+    pkill -9 -f "fastchat.serve.vllm_worker" 2>/dev/null
+
+    # Wait for GPU memory to be released
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Waiting 10s for GPU memory to release..."
+    sleep 10
+
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] vLLM workers cleanup complete."
+}
+
 # Cleanup function for Ctrl+C
 cleanup() {
     echo ""
@@ -26,6 +61,10 @@ cleanup() {
             kill -9 $pid 2>/dev/null
         fi
     done
+
+    # Kill any remaining vllm_worker processes
+    pkill -9 -f "vllm_worker" 2>/dev/null
+    pkill -9 -f "fastchat.serve.vllm_worker" 2>/dev/null
 
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Cleanup complete."
     exit 1
@@ -53,6 +92,7 @@ logs_path=${save_path}logs
 # Graph-IPR specific parameters
 max_graph_nodes=5000
 gamma=0.99
+alpha=0.1
 vi_iterations=15
 step_threshold=0.05
 traj_threshold=0.01
@@ -77,7 +117,7 @@ mkdir -p ${logs_path}/
 
 cur_model_name=${sft_model_name}
 monte_carlo_explore_model_name=${cur_model_name}-monte-carlo-explore
-gpu_list=(3 4 5)
+gpu_list=(0 1 6)
 
 # Initialize global graph path
 global_graph_path=${save_path}global_state_graph.pkl
@@ -107,7 +147,7 @@ for i in {1..6}; do
             --model-path ${save_dir}${explore_model_name}-${j} \
             --port ${fs_worker_port} \
             --worker-address http://localhost:${fs_worker_port} \
-            --gpu-memory-utilization 0.75 \
+            --gpu-memory-utilization 0.9 \
             --no-register >> ${logs_path}/model_worker-${j}.log 2>&1 &
         echo $! >> ${logs_path}/worker_pid.txt
         fs_worker_port=$((fs_worker_port+1))
@@ -129,10 +169,10 @@ for i in {1..6}; do
     done
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Waiting for generate_response to complete..."
     wait $(cat ${logs_path}/eval_pid.txt)
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Generate response completed. Killing vLLM workers..."
-    kill -9 $(cat ${logs_path}/worker_pid.txt) 2>/dev/null
-    rm -f ${logs_path}/worker_pid.txt
-    sleep 5
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Generate response completed."
+
+    # Thoroughly kill vLLM workers and free GPU memory before MC sampling
+    kill_vllm_workers
 
     num_traj_files=$(ls ${step_traj_save_path}/*.json 2>/dev/null | wc -l)
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Generated ${num_traj_files} trajectory files"
@@ -156,7 +196,7 @@ for i in {1..6}; do
             --model-path ${save_dir}${monte_carlo_explore_model_name}-${j} \
             --port ${fs_worker_port} \
             --worker-address http://localhost:${fs_worker_port} \
-            --gpu-memory-utilization 0.75 \
+            --gpu-memory-utilization 0.9 \
             --no-register >> ${logs_path}/model_worker-${j}.log 2>&1 &
         echo $! >> ${logs_path}/worker_pid.txt
         fs_worker_port=$((fs_worker_port+1))
@@ -166,7 +206,7 @@ for i in {1..6}; do
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Waiting 60s for vLLM workers to initialize..."
     sleep 60
 
-    sample_workers=16
+    sample_workers=3
     monte_carlo_sample_save_path=${save_path}monte_carlo_sample_iteration_${i}/sampled_traj_0
     mkdir -p ${monte_carlo_sample_save_path}
 
@@ -174,13 +214,16 @@ for i in {1..6}; do
     echo "[$(date '+%Y-%m-%d %H:%M:%S')]   - gamma=${gamma}, max_nodes=${max_graph_nodes}, vi_iter=${vi_iterations}"
     rm -f ${logs_path}/eval_pid.txt
     for ((l=0;l<$sample_workers; l++)); do
+        # 每个 worker 保存到独立子目录，避免图文件互相覆盖
+        worker_save_path=${monte_carlo_sample_save_path}/worker_${l}
+        mkdir -p ${worker_save_path}
         python monte_carlo_sample_alfworld_graph.py \
             --agent_config fastchat_explore \
             --model_name ${monte_carlo_explore_model_name}-$((l%sample_num_workers)) \
             --exp_config ${task} \
             --part_num ${sample_workers} \
             --part_idx ${l} \
-            --save_path ${monte_carlo_sample_save_path}/ \
+            --save_path ${worker_save_path}/ \
             --data_path ${step_traj_save_path} \
             --gamma ${gamma} \
             --max_graph_nodes ${max_graph_nodes} \
@@ -190,10 +233,10 @@ for i in {1..6}; do
     done
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Waiting for MC sampling to complete..."
     wait $(cat ${logs_path}/eval_pid.txt)
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] MC sampling completed. Killing vLLM workers..."
-    kill -9 $(cat ${logs_path}/worker_pid.txt) 2>/dev/null
-    rm -f ${logs_path}/worker_pid.txt
-    sleep 5
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] MC sampling completed."
+
+    # Thoroughly kill vLLM workers and free GPU memory
+    kill_vllm_workers
 
     num_mc_files=$(ls ${monte_carlo_sample_save_path}/*.json 2>/dev/null | wc -l)
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Generated ${num_mc_files} MC sample files"
@@ -204,7 +247,9 @@ for i in {1..6}; do
     python -m graph_ipr.merge_graphs \
         --input_dir ${monte_carlo_sample_save_path} \
         --output_path ${global_graph_path} \
-        --max_nodes ${max_graph_nodes}
+        --max_nodes ${max_graph_nodes} \
+        --gamma ${gamma} \
+        --alpha ${alpha}
 
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Graph merge completed."
 
@@ -296,7 +341,7 @@ for i in {1..6}; do
         --model-path ${save_dir}${dpo_model_name} \
         --port ${fs_worker_port} \
         --worker-address http://localhost:${fs_worker_port} \
-        --gpu-memory-utilization 0.75 \
+        --gpu-memory-utilization 0.9 \
         --no-register >> ${logs_path}/model_worker.log 2>&1 &
     fs_worker_pid=$!
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Waiting 30s for eval worker to initialize..."

@@ -143,6 +143,8 @@ class StateActionGraph:
         self.nodes: Dict[str, StateNode] = {}
         # edges[source_id][action_hash] -> List[ActionEdge]
         self.edges: Dict[str, Dict[str, List[ActionEdge]]] = defaultdict(lambda: defaultdict(list))
+        # 反向索引: incoming_edges[target_id] -> Set[source_id]，用于快速删除节点
+        self.incoming_edges: Dict[str, Set[str]] = defaultdict(set)
 
         # Index structures
         self.task_states: Dict[int, Set[str]] = defaultdict(set)  # task_id -> {state_ids}
@@ -328,6 +330,8 @@ class StateActionGraph:
         )
 
         self.edges[source_state.state_id][action_hash].append(edge)
+        # 维护反向索引
+        self.incoming_edges[target_state.state_id].add(source_state.state_id)
         return edge
 
     def add_trajectory(
@@ -343,6 +347,7 @@ class StateActionGraph:
         Args:
             task_id: Task identifier
             trajectory: List of {observation, action, reward} dicts
+                        where reward is the reward received after executing action
             final_reward: Final trajectory reward
             is_successful: Whether the trajectory succeeded
 
@@ -353,6 +358,7 @@ class StateActionGraph:
         history = []
         prev_state = None
         prev_action = None
+        prev_reward = 0  # 用于正确对齐 reward
         state_sequence = []
 
         self.total_trajectories += 1
@@ -380,18 +386,20 @@ class StateActionGraph:
             history.append({'role': 'user', 'content': observation})
             history.append({'role': 'assistant', 'content': action})
 
-            # Add transition edge
+            # Add transition edge: edge(s_{i-1}, a_{i-1} -> s_i) 使用 prev_reward
+            # prev_reward 是执行 prev_action 后获得的奖励，即 trajectory[i-1].reward
             if prev_state is not None and prev_action is not None:
                 edge = self.add_transition(
                     source_state=prev_state,
                     action=prev_action,
                     target_state=current_state,
-                    immediate_reward=step_reward,
+                    immediate_reward=prev_reward,
                 )
                 result.append((prev_state, edge))
 
             prev_state = current_state
             prev_action = action
+            prev_reward = step_reward  # 保存当前 reward 供下一步使用
 
         # Record successful path
         if is_successful and state_sequence:
@@ -476,20 +484,30 @@ class StateActionGraph:
 
         node = self.nodes[state_id]
 
-        # Remove outgoing edges
+        # Remove outgoing edges and update incoming_edges of targets
         if state_id in self.edges:
+            for action_hash, edges in self.edges[state_id].items():
+                for edge in edges:
+                    # 从 target 的反向索引中移除 source
+                    if edge.target_id in self.incoming_edges:
+                        self.incoming_edges[edge.target_id].discard(state_id)
             del self.edges[state_id]
 
-        # Remove incoming edges
-        for source_id in list(self.edges.keys()):
-            for action_hash in list(self.edges[source_id].keys()):
-                self.edges[source_id][action_hash] = [
-                    e for e in self.edges[source_id][action_hash]
-                    if e.target_id != state_id
-                ]
-                # Clean up empty lists
-                if not self.edges[source_id][action_hash]:
-                    del self.edges[source_id][action_hash]
+        # Remove incoming edges (使用反向索引，O(入度) 而不是 O(E))
+        for source_id in self.incoming_edges.get(state_id, set()).copy():
+            if source_id in self.edges:
+                for action_hash in list(self.edges[source_id].keys()):
+                    self.edges[source_id][action_hash] = [
+                        e for e in self.edges[source_id][action_hash]
+                        if e.target_id != state_id
+                    ]
+                    # Clean up empty lists
+                    if not self.edges[source_id][action_hash]:
+                        del self.edges[source_id][action_hash]
+
+        # Remove from incoming_edges index
+        if state_id in self.incoming_edges:
+            del self.incoming_edges[state_id]
 
         # Remove node from indexes
         del self.nodes[state_id]
@@ -516,6 +534,16 @@ class StateActionGraph:
 
     def save(self, filepath: str):
         """Save graph to file"""
+        # Count edges
+        total_edges = sum(
+            len(edges)
+            for action_dict in self.edges.values()
+            for edges in action_dict.values()
+        )
+        print(f"Saving graph: {len(self.nodes)} nodes, {total_edges} edges, "
+              f"{len(self.terminal_states)} terminal states, "
+              f"{self.successful_trajectories}/{self.total_trajectories} successful trajectories")
+
         data = {
             'task_name': self.task_name,
             'max_nodes': self.max_nodes,
@@ -566,6 +594,16 @@ class StateActionGraph:
         for task_id_str, state_ids in data.get('task_states', {}).items():
             graph.task_states[int(task_id_str)] = set(state_ids)
 
+        # Count edges for logging
+        total_edges = sum(
+            len(edges)
+            for action_dict in graph.edges.values()
+            for edges in action_dict.values()
+        )
+        print(f"Loaded graph: {len(graph.nodes)} nodes, {total_edges} edges, "
+              f"{len(graph.terminal_states)} terminal states, "
+              f"{len(graph.incoming_edges)} nodes with incoming edges")
+
         return graph
 
     def _edges_to_dict(self) -> Dict:
@@ -581,9 +619,11 @@ class StateActionGraph:
         """Deserialize edges from dictionary"""
         for source_id, action_dict in data.items():
             for action_hash, edges_data in action_dict.items():
-                self.edges[source_id][action_hash] = [
-                    ActionEdge.from_dict(e) for e in edges_data
-                ]
+                edges = [ActionEdge.from_dict(e) for e in edges_data]
+                self.edges[source_id][action_hash] = edges
+                # 重建反向索引
+                for edge in edges:
+                    self.incoming_edges[edge.target_id].add(source_id)
 
     def merge_from(self, other: 'StateActionGraph'):
         """
@@ -625,6 +665,8 @@ class StateActionGraph:
 
                     if not found:
                         existing_edges.append(edge)
+                        # 维护反向索引
+                        self.incoming_edges[edge.target_id].add(source_id)
 
         # Merge indexes
         self.terminal_states.update(other.terminal_states)

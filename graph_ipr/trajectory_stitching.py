@@ -520,8 +520,13 @@ class GraphPreferenceBuilder:
         if not expert_convs:
             return None
 
-        # Convert expert trajectory to trajectory format
-        expert_traj = self._conversations_to_trajectory(expert_convs)
+        # Convert expert trajectory to trajectory format (skip instruction part)
+        # expert_convs[:instruction_part_len] 是 instruction 部分，跳过
+        task_convs = expert_convs[instruction_part_len:]
+        expert_traj = self._conversations_to_trajectory(task_convs)
+
+        if not expert_traj:
+            return None
 
         # Try to find a better path from each intermediate state
         history = []
@@ -542,13 +547,24 @@ class GraphPreferenceBuilder:
             # Compute path Q-value
             path_q = self.stitcher.compute_path_q(best_path)
 
-            # Compute expert remaining Q-value
-            remaining_expert_q = self._compute_remaining_q(expert_convs, i, task_id)
+            # Compute expert remaining Q-value (从 task_convs 的第 i 步开始)
+            remaining_expert_q = self._compute_trajectory_q(task_convs[i * 2:], task_id)
 
             # If graph path is significantly better
-            if path_q > remaining_expert_q * self.stitching_threshold:
+            # 处理 expert Q 为 0 或接近 0 的情况，避免乘法阈值失效
+            is_better = False
+            if abs(remaining_expert_q) < 0.01:
+                # 当 expert Q 接近 0 时，使用绝对阈值
+                is_better = path_q > 0.1
+            else:
+                is_better = path_q > remaining_expert_q * self.stitching_threshold
+
+            if is_better:
                 # Build stitching preference
-                prefix_convs = expert_convs[:i * 2 + instruction_part_len + 1]
+                # prompt = instruction + task_convs 前 i 步 (包含当前 observation)
+                # i * 2 是因为每步有 (human, gpt) 两条消息
+                # +1 是包含当前 observation (human)
+                prefix_convs = expert_convs[:instruction_part_len + i * 2 + 1]
                 graph_suffix = self.stitcher.path_to_conversations(best_path)
 
                 iteration = agent_item.get('iteration', 0)
@@ -557,7 +573,7 @@ class GraphPreferenceBuilder:
                     "id": int(f"{task_id}{iteration}_stitch_{i}"),
                     "prompt": prefix_convs,
                     "chosen": graph_suffix,
-                    "rejected": expert_convs[i * 2 + instruction_part_len + 1:],
+                    "rejected": task_convs[i * 2 + 1:],  # 从当前 gpt response 开始
                     "stitching_point": i,
                     "path_q": path_q,
                     "expert_q": remaining_expert_q,
@@ -568,19 +584,6 @@ class GraphPreferenceBuilder:
             history.append({'role': 'assistant', 'content': trans['action']})
 
         return None
-
-    def _compute_remaining_q(
-        self,
-        conversations: List[Dict],
-        start_idx: int,
-        task_id: int,
-    ) -> float:
-        """Compute Q-value for remaining trajectory from start_idx"""
-        # Skip to the right position in conversations
-        # Each step is 2 messages (user + assistant)
-        conv_start = start_idx * 2
-        remaining_convs = conversations[conv_start:]
-        return self._compute_trajectory_q(remaining_convs, task_id)
 
     def _conversations_to_trajectory(self, conversations: List[Dict]) -> List[Dict]:
         """Convert conversation format to trajectory format"""

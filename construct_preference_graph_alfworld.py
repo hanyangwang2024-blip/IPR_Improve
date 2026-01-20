@@ -115,22 +115,34 @@ def cal_monte_carlo_reward(args) -> List[Dict]:
     results = {}
     results_original_reward = {}
 
-    sample_num = len(glob.glob(traj_path + "/*"))
-    for i in range(sample_num):
-        paths = glob.glob(f"{traj_path}/sampled_traj_{i}/*.json")
-        cur_results = []
-        for path in paths:
-            cur_results.extend(json.load(open(path)))
-        for item in cur_results:
-            id = item['id']
-            iteration = item['iteration']
-            id_iteration = f"{id}_{iteration}"
-            if id_iteration not in results:
-                results[id_iteration] = [item['agent_final_reward']]
-            else:
-                results[id_iteration].append(item['agent_final_reward'])
-            if id_iteration not in results_original_reward:
-                results_original_reward[id_iteration] = item['agent_step_reward']
+    # 递归搜索所有 JSON 文件，兼容新旧目录结构
+    # 新结构: sample_path/sampled_traj_0/worker_*/alfworld_traj_*.json
+    # 旧结构: sample_path/sampled_traj_*/alfworld_traj_*.json
+    all_json_paths = glob.glob(f"{traj_path}/**/*.json", recursive=True)
+
+    if not all_json_paths:
+        print(f"Warning: No JSON files found in {traj_path}")
+
+    for path in all_json_paths:
+        try:
+            cur_results = json.load(open(path))
+            if not isinstance(cur_results, list):
+                cur_results = [cur_results]
+            for item in cur_results:
+                if 'id' not in item or 'iteration' not in item:
+                    continue
+                id = item['id']
+                iteration = item['iteration']
+                id_iteration = f"{id}_{iteration}"
+                if id_iteration not in results:
+                    results[id_iteration] = [item.get('agent_final_reward', 0)]
+                else:
+                    results[id_iteration].append(item.get('agent_final_reward', 0))
+                if id_iteration not in results_original_reward:
+                    results_original_reward[id_iteration] = item.get('agent_step_reward', 0)
+        except Exception as e:
+            print(f"Warning: Failed to load {path}: {e}")
+            continue
 
     final_results = {}
     for key, value in results.items():
